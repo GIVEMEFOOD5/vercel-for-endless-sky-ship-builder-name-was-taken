@@ -1,56 +1,58 @@
 /* ═══════════════════════════════════════════════════════════════
    /api/update-json.js  —  Vercel Serverless Function
-   Receives a POST request from the GitHub Pages frontend and
-   updates plugins.json in the GitHub repository via the GitHub
-   REST API.  The GitHub token never leaves this function.
+   Receives a POST request from the GitHub Pages frontend and:
+     1. Updates plugins.json in the GitHub repository
+     2. Immediately writes parse-status.json to "running" so the
+        frontend sees the state change without waiting for the
+        GitHub Action to spin up (which takes 30-60 seconds)
+
+   Required Vercel environment variables:
+     GITHUB_TOKEN   → Personal access token with repo write scope
+     GITHUB_OWNER   → e.g. "givemefood5"
+     GITHUB_REPO    → e.g. "endless-sky-ship-builder"
+     GITHUB_PATH    → e.g. "plugins.json"
+     GITHUB_BRANCH  → e.g. "main" (defaults to "main")
+     ALLOWED_ORIGINS → comma-separated list of allowed origins
+     SECRET_KEY     → optional shared secret for access control
    ═══════════════════════════════════════════════════════════════ */
 
 'use strict';
 
-/* ── Configuration ───────────────────────────────────────────────
-   All three values must be set:
-     GITHUB_TOKEN  → Vercel environment variable (never hardcoded)
-     GITHUB_OWNER  → Vercel environment variable  e.g. "jane-doe"
-     GITHUB_REPO   → Vercel environment variable  e.g. "endless-sky-plugins"
-     GITHUB_PATH   → Vercel environment variable  e.g. "plugins.json"
-                     (can be a sub-path: "data/plugins.json")
-   ─────────────────────────────────────────────────────────────── */
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-const GITHUB_OWNER = process.env.GITHUB_OWNER;
-const GITHUB_REPO  = process.env.GITHUB_REPO;
-const GITHUB_PATH  = process.env.GITHUB_PATH || 'plugins.json';
-const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main'; // or 'master'
+const GITHUB_TOKEN  = process.env.GITHUB_TOKEN;
+const GITHUB_OWNER  = process.env.GITHUB_OWNER;
+const GITHUB_REPO   = process.env.GITHUB_REPO;
+const GITHUB_PATH   = process.env.GITHUB_PATH   || 'plugins.json';
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || 'main';
+const SECRET_KEY    = process.env.SECRET_KEY;
 
-/* ── Optional simple shared secret for basic access control ──────
-   Set SECRET_KEY in your Vercel env vars and send it from the
-   frontend in the X-Update-Secret header.
-   Leave SECRET_KEY unset to disable this check entirely.
-   ─────────────────────────────────────────────────────────────── */
-const SECRET_KEY = process.env.SECRET_KEY;
-
-/* ── GitHub API base URL ──────────────────────────────────────── */
-const GH_API = 'https://api.github.com';
-
-/* ── CORS: list every origin that is allowed to call this API ────
-   Replace with your actual GitHub Pages domain.
-   ─────────────────────────────────────────────────────────────── */
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+    .split(',').map(s => s.trim()).filter(Boolean);
+
+/* ── Pre-built constants (built once at module load) ─────────── */
+const FILE_URL   = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_PATH}`;
+const STATUS_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/parse-status.json`;
+
+const GH_HEADERS = {
+    Accept:                 'application/vnd.github+json',
+    Authorization:          `Bearer ${GITHUB_TOKEN}`,
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Content-Type':         'application/json',
+};
+
+/* ── SHA cache — Vercel keeps function instances warm ────────── */
+let _cachedPluginsSha = null;
+let _cachedStatusSha  = null;
 
 /* ═══════════════════════════════════════════════════════════════
    Helper: build CORS headers for a given request origin
    ═══════════════════════════════════════════════════════════════ */
 function corsHeaders(requestOrigin) {
-    // If no allowed origins are configured, deny cross-origin requests.
-    // During local dev you can set ALLOWED_ORIGINS=* in .env.local
     const allow =
-        ALLOWED_ORIGINS.includes('*') ? '*' :
+        ALLOWED_ORIGINS.includes('*')           ? '*'           :
         ALLOWED_ORIGINS.includes(requestOrigin) ? requestOrigin :
         null;
 
-    if (!allow) return {};   // caller will return 403
+    if (!allow) return {};
 
     return {
         'Access-Control-Allow-Origin':  allow,
@@ -61,23 +63,47 @@ function corsHeaders(requestOrigin) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   Helper: call the GitHub Contents API
+   Helper: fetch current SHA for a file (uses cache if available)
    ═══════════════════════════════════════════════════════════════ */
-async function githubFetch(path, options = {}) {
-    const url = `${GH_API}/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_PATH}`;
-    const res = await fetch(url, {
-        ...options,
-        headers: {
-            Accept:        'application/vnd.github+json',
-            Authorization: `Bearer ${GITHUB_TOKEN}`,
-            'X-GitHub-Api-Version': '2022-11-28',
-            'Content-Type': 'application/json',
-            ...(options.headers || {}),
-        },
-    });
+async function fetchSha(url, cachedSha) {
+    if (cachedSha) return { sha: cachedSha, fromCache: true };
+
+    const res = await fetch(url, { headers: GH_HEADERS });
+    if (!res.ok) {
+        // 404 means the file doesn't exist yet — that's fine, sha = null
+        if (res.status === 404) return { sha: null, fromCache: false };
+        const body = await res.json().catch(() => ({}));
+        throw new Error(`GitHub GET failed (${res.status}): ${body?.message || res.statusText}`);
+    }
 
     const body = await res.json().catch(() => ({}));
-    return { status: res.status, ok: res.ok, body };
+    return { sha: body?.sha ?? null, fromCache: false };
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Helper: commit a file to GitHub
+   ═══════════════════════════════════════════════════════════════ */
+async function commitFile(url, content, sha, message) {
+    const base64Content = Buffer.from(content, 'utf8').toString('base64');
+
+    const body = {
+        message,
+        content: base64Content,
+        branch:  GITHUB_BRANCH,
+    };
+
+    // sha is required when updating an existing file;
+    // omit it entirely when creating a new file
+    if (sha) body.sha = sha;
+
+    const res = await fetch(url, {
+        method:  'PUT',
+        headers: GH_HEADERS,
+        body:    JSON.stringify(body),
+    });
+
+    const resBody = await res.json().catch(() => ({}));
+    return { ok: res.ok, status: res.status, body: resBody };
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -88,29 +114,23 @@ export default async function handler(req, res) {
     const cors   = corsHeaders(origin);
 
     /* ── Reject disallowed origins ───────────────────────────── */
-    if (origin && Object.keys(cors).length === 0) {
+    if (origin && Object.keys(cors).length === 0)
         return res.status(403).json({ error: 'Origin not allowed.' });
-    }
 
-    /* ── Set CORS headers on every response ──────────────────── */
     Object.entries(cors).forEach(([k, v]) => res.setHeader(k, v));
 
     /* ── Handle CORS pre-flight ──────────────────────────────── */
-    if (req.method === 'OPTIONS') {
-        return res.status(204).end();
-    }
+    if (req.method === 'OPTIONS') return res.status(204).end();
 
     /* ── Only POST is accepted ───────────────────────────────── */
-    if (req.method !== 'POST') {
+    if (req.method !== 'POST')
         return res.status(405).json({ error: 'Method not allowed. Use POST.' });
-    }
 
-    /* ── Verify shared secret (optional, recommended) ────────── */
+    /* ── Verify shared secret (optional) ─────────────────────── */
     if (SECRET_KEY) {
         const provided = req.headers['x-update-secret'] || '';
-        if (provided !== SECRET_KEY) {
+        if (provided !== SECRET_KEY)
             return res.status(401).json({ error: 'Unauthorised: invalid or missing secret.' });
-        }
     }
 
     /* ── Validate environment variables ──────────────────────── */
@@ -122,68 +142,108 @@ export default async function handler(req, res) {
     /* ── Parse and validate the request body ─────────────────── */
     let payload;
     try {
-        // Vercel automatically parses JSON bodies; fall back to manual parse
         payload = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
     } catch {
         return res.status(400).json({ error: 'Invalid JSON body.' });
     }
 
-    if (!payload || !Array.isArray(payload.plugins)) {
+    if (!payload || !Array.isArray(payload.plugins))
         return res.status(400).json({ error: 'Body must be { plugins: [...] }.' });
+
+    /* ── Step 1: Get current SHA for plugins.json ────────────── */
+    let pluginsSha;
+    try {
+        const result  = await fetchSha(FILE_URL, _cachedPluginsSha);
+        pluginsSha    = result.sha;
+    } catch (err) {
+        console.error('[update-json] Failed to fetch plugins.json SHA:', err.message);
+        return res.status(502).json({ error: `Could not reach GitHub API: ${err.message}` });
     }
 
-    /* ── Step 1: fetch the current file to get its SHA ───────── */
-    const getResult = await githubFetch().catch(err => {
-        console.error('[update-json] Network error fetching file:', err);
-        return null;
-    });
-
-    if (!getResult) {
-        return res.status(502).json({ error: 'Could not reach GitHub API.' });
+    if (!pluginsSha) {
+        _cachedPluginsSha = null;
+        return res.status(502).json({ error: 'Could not retrieve plugins.json SHA from GitHub.' });
     }
 
-    if (!getResult.ok) {
-        const msg = getResult.body?.message || `HTTP ${getResult.status}`;
-        console.error('[update-json] GitHub GET failed:', msg);
-        return res.status(502).json({ error: `GitHub API error: ${msg}` });
+    /* ── Step 2: Commit updated plugins.json ─────────────────── */
+    const newPluginsContent = JSON.stringify({ plugins: payload.plugins }, null, 2);
+    let pluginsPutResult;
+
+    try {
+        pluginsPutResult = await commitFile(
+            FILE_URL,
+            newPluginsContent,
+            pluginsSha,
+            'chore: update plugins.json via plugin manager'
+        );
+    } catch (err) {
+        _cachedPluginsSha = null;
+        console.error('[update-json] Network error writing plugins.json:', err.message);
+        return res.status(502).json({ error: `Network error writing file: ${err.message}` });
     }
 
-    const currentSha = getResult.body?.sha;
-    if (!currentSha) {
-        return res.status(502).json({ error: 'Could not retrieve file SHA from GitHub.' });
+    /* ── Handle SHA conflict (two people saving simultaneously) ─ */
+    if (pluginsPutResult.status === 409) {
+        _cachedPluginsSha = null;
+        return res.status(409).json({
+            error: 'Conflict: plugins.json was updated by someone else. Please refresh and try again.'
+        });
     }
 
-    /* ── Step 2: encode the new content as base64 ────────────── */
-    const newContent   = JSON.stringify({ plugins: payload.plugins }, null, 2);
-    const base64Content = Buffer.from(newContent, 'utf8').toString('base64');
-
-    /* ── Step 3: commit the new content via PUT ──────────────── */
-    const putResult = await githubFetch(null, {
-        method: 'PUT',
-        body: JSON.stringify({
-            message: 'chore: update plugins.json via plugin manager',
-            content: base64Content,
-            sha:     currentSha,
-            branch:  GITHUB_BRANCH,
-        }),
-    }).catch(err => {
-        console.error('[update-json] Network error writing file:', err);
-        return null;
-    });
-
-    if (!putResult) {
-        return res.status(502).json({ error: 'Could not reach GitHub API for write.' });
-    }
-
-    if (!putResult.ok) {
-        const msg = putResult.body?.message || `HTTP ${putResult.status}`;
-        console.error('[update-json] GitHub PUT failed:', msg);
+    if (!pluginsPutResult.ok) {
+        _cachedPluginsSha = null;
+        const msg = pluginsPutResult.body?.message || `HTTP ${pluginsPutResult.status}`;
+        console.error('[update-json] GitHub PUT failed for plugins.json:', msg);
         return res.status(502).json({ error: `GitHub commit failed: ${msg}` });
+    }
+
+    // Cache the new SHA returned by GitHub so the next save skips the GET
+    _cachedPluginsSha = pluginsPutResult.body?.content?.sha ?? null;
+    const commitSha   = pluginsPutResult.body?.commit?.sha  ?? null;
+
+    /* ── Step 3: Immediately write parse-status.json = running ──
+       This means the frontend sees "running" within seconds of the
+       save completing, rather than waiting 30-60s for GitHub Actions
+       to spin up and write it themselves.
+       Non-fatal: if this fails the Action will still set it eventually. */
+    try {
+        // Get current SHA of parse-status.json (needed to update it)
+        const statusShaResult = await fetchSha(STATUS_URL, _cachedStatusSha);
+        const statusSha       = statusShaResult.sha; // null = file doesn't exist yet
+
+        const statusContent = JSON.stringify({
+            status:    'running',
+            startedAt: new Date().toISOString(),
+        }, null, 2);
+
+        const statusPutResult = await commitFile(
+            STATUS_URL,
+            statusContent,
+            statusSha,
+            'chore: mark parse as running'
+        );
+
+        if (statusPutResult.ok) {
+            // Cache the new status SHA
+            _cachedStatusSha = statusPutResult.body?.content?.sha ?? null;
+            console.log('[update-json] parse-status.json set to running');
+        } else {
+            // Non-fatal — log and continue
+            _cachedStatusSha = null;
+            console.warn(
+                '[update-json] Could not write parse-status.json:',
+                statusPutResult.body?.message || statusPutResult.status
+            );
+        }
+    } catch (err) {
+        // Non-fatal — the Action will still set it, just with the usual delay
+        _cachedStatusSha = null;
+        console.warn('[update-json] Could not pre-set parse-status.json:', err.message);
     }
 
     /* ── All done ────────────────────────────────────────────── */
     return res.status(200).json({
         ok:     true,
-        commit: putResult.body?.commit?.sha ?? null,
+        commit: commitSha,
     });
 }
