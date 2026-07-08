@@ -3,8 +3,12 @@
     "api/update-json.js": {
       "maxDuration": 10
     },
+    "api/blob-upload.js": {
+      "includeFiles": "node_modules/@vercel/blob/dist/**"
+    },
     "api/commit-archive.js": {
-      "maxDuration": 60
+      "maxDuration": 60,
+      "includeFiles": "node_modules/@vercel/blob/dist/**"
     }
   }
 }
