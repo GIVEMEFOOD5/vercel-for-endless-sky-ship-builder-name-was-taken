@@ -2,6 +2,9 @@
   "functions": {
     "api/update-json.js": {
       "maxDuration": 10
+    },
+    "api/commit-archive.js": {
+      "maxDuration": 60
     }
   }
 }
