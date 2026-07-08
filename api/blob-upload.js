@@ -69,12 +69,22 @@ export default async function handler(req, res) {
     if (req.method !== 'POST')
         return res.status(405).json({ error: 'Method not allowed. Use POST.' });
 
+    if (!process.env.BLOB_READ_WRITE_TOKEN) {
+        console.error('[blob-upload] BLOB_READ_WRITE_TOKEN is missing or empty at runtime.');
+        return res.status(500).json({ error: 'Server misconfiguration: BLOB_READ_WRITE_TOKEN is not set.' });
+    }
+
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
 
     try {
         const jsonResponse = await handleUpload({
             body,
             request: req,
+            // Passed explicitly rather than relying on handleUpload's
+            // "defaults to process.env.BLOB_READ_WRITE_TOKEN when deployed
+            // on Vercel" auto-detection — that heuristic is opaque from
+            // the outside, so we remove it as a variable entirely.
+            token: process.env.BLOB_READ_WRITE_TOKEN,
 
             onBeforeGenerateToken: async (pathname, clientPayload) => {
                 // Optional shared-secret check, mirroring update-json.js.
